@@ -1,17 +1,29 @@
 use crate::cache::engine::{CacheEngine, VolumeStatus};
 use crate::device;
 use crate::error::{CloudError, Result};
-use crate::util::{atomic_write, human_size, parse_size, registry_path};
-use crate::volume::manifest::{CloudManifest, LocalManifest};
+use crate::util::{atomic_write, default_volume_cache_dir, human_size, parse_size, registry_path};
+use crate::volume::manifest::{CloudManifest, DEFAULT_SECTOR_SIZE_BYTES, LocalManifest};
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug)]
+pub enum CliError {
+    Clap(clap::Error),
+    Cloud(CloudError),
+}
+
+impl From<CloudError> for CliError {
+    fn from(err: CloudError) -> Self {
+        Self::Cloud(err)
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "cloudcache")]
 #[command(about = "Cloud-backed local block cache prototype")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -34,6 +46,12 @@ enum Commands {
         cache_dir: Option<PathBuf>,
         #[arg(long)]
         remote_dir: Option<PathBuf>,
+        #[arg(long, default_value = "local_mock", value_parser = ["local_mock", "s3"])]
+        cloud_provider: String,
+        #[arg(long)]
+        region: Option<String>,
+        #[arg(long)]
+        endpoint_url: Option<String>,
         #[arg(long, default_value = "200G")]
         cache_size: String,
     },
@@ -69,9 +87,8 @@ enum Commands {
     List,
 }
 
-pub fn run(args: Vec<String>) -> Result<()> {
-    let cli =
-        Cli::try_parse_from(args).map_err(|err| CloudError::InvalidArgument(err.to_string()))?;
+pub fn run(args: Vec<String>) -> std::result::Result<(), CliError> {
+    let cli = Cli::try_parse_from(args).map_err(CliError::Clap)?;
     match cli.command {
         Commands::Create {
             volume_id,
@@ -81,15 +98,28 @@ pub fn run(args: Vec<String>) -> Result<()> {
             prefix,
             cache_dir,
             remote_dir,
+            cloud_provider,
+            region,
+            endpoint_url,
             cache_size,
         } => create(
-            volume_id, size, chunk_size, bucket, prefix, cache_dir, remote_dir, cache_size,
-        ),
+            volume_id,
+            size,
+            chunk_size,
+            bucket,
+            prefix,
+            cache_dir,
+            remote_dir,
+            cloud_provider,
+            region,
+            endpoint_url,
+            cache_size,
+        )?,
         Commands::Attach {
             volume_id,
             device,
             cache_dir,
-        } => attach(&volume_id, &device, cache_dir.as_deref()),
+        } => attach(&volume_id, &device, cache_dir.as_deref())?,
         Commands::Detach {
             volume_id,
             device,
@@ -98,21 +128,22 @@ pub fn run(args: Vec<String>) -> Result<()> {
             volume_id.as_deref(),
             device.as_deref(),
             cache_dir.as_deref(),
-        ),
+        )?,
         Commands::Status {
             volume_id,
             cache_dir,
-        } => status(&volume_id, cache_dir.as_deref()),
+        } => status(&volume_id, cache_dir.as_deref())?,
         Commands::Sync {
             volume_id,
             cache_dir,
-        } => sync(&volume_id, cache_dir.as_deref()),
+        } => sync(&volume_id, cache_dir.as_deref())?,
         Commands::Fsck {
             volume_id,
             cache_dir,
-        } => fsck(&volume_id, cache_dir.as_deref()),
-        Commands::List => list(),
-    }
+        } => fsck(&volume_id, cache_dir.as_deref())?,
+        Commands::List => list()?,
+    };
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -124,33 +155,47 @@ fn create(
     prefix: Option<String>,
     cache_dir: Option<PathBuf>,
     remote_dir: Option<PathBuf>,
+    cloud_provider: String,
+    region: Option<String>,
+    endpoint_url: Option<String>,
     cache_size: String,
 ) -> Result<()> {
+    validate_volume_id(&volume_id)?;
     let size = parse_size(&size)?;
     let chunk_size = parse_size(&chunk_size)?;
-    if chunk_size == 0 || size == 0 {
-        return Err(CloudError::InvalidArgument(
-            "size and chunk-size must be non-zero".to_string(),
-        ));
-    }
-
-    let cache_dir = cache_dir.unwrap_or_else(|| {
-        PathBuf::from(".cloudcache")
-            .join("volumes")
-            .join(&volume_id)
-    });
-    let remote_dir = remote_dir.unwrap_or_else(|| cache_dir.join("remote_mock"));
     let cache_max = parse_size(&cache_size)?;
-    let bucket = bucket.unwrap_or_else(|| "local-mock".to_string());
+    validate_volume_layout(size, chunk_size, cache_max)?;
+
+    let cache_dir =
+        absolute_path(cache_dir.unwrap_or_else(|| default_volume_cache_dir(&volume_id)))?;
+    let remote_dir = match (&cloud_provider[..], remote_dir) {
+        ("local_mock", Some(remote_dir)) => absolute_path(remote_dir)?,
+        ("local_mock", None) => cache_dir.join("remote_mock"),
+        ("s3", Some(remote_dir)) => absolute_path(remote_dir)?,
+        ("s3", None) => PathBuf::new(),
+        _ => unreachable!("clap validates cloud_provider"),
+    };
+    let bucket = match cloud_provider.as_str() {
+        "local_mock" => bucket.unwrap_or_else(|| "local-mock".to_string()),
+        "s3" => bucket.ok_or_else(|| {
+            CloudError::InvalidArgument("S3 backend requires --bucket".to_string())
+        })?,
+        _ => unreachable!("clap validates cloud_provider"),
+    };
     let prefix = prefix.unwrap_or_else(|| format!("cloudcache/volumes/{volume_id}"));
 
     let cloud_manifest = CloudManifest::new(volume_id.clone(), size, chunk_size);
     let local_manifest = LocalManifest::new(
         volume_id.clone(),
         cache_dir.clone(),
-        bucket,
-        prefix,
-        remote_dir,
+        crate::volume::manifest::CloudConfig {
+            provider: cloud_provider,
+            bucket,
+            prefix,
+            remote_dir,
+            region,
+            endpoint_url,
+        },
         cache_max,
     );
     CacheEngine::create(cloud_manifest, local_manifest)?;
@@ -232,7 +277,7 @@ fn print_status(status: &VolumeStatus) {
     println!("Volume: {}", status.volume_id);
     println!("Size: {}", human_size(status.volume_size_bytes));
     println!("Chunk size: {}", human_size(status.chunk_size_bytes));
-    println!("Remote mock: {}", status.remote_dir.display());
+    println!("Cloud backend: {}", status.cloud_backend);
     println!("Cache:");
     println!(
         "  Used: {} / {}",
@@ -258,9 +303,13 @@ fn resolve_cache_dir(volume_id: &str, explicit: Option<&Path>) -> Result<PathBuf
     if let Some(path) = read_registry()?.get(volume_id) {
         return Ok(path.clone());
     }
-    let default = PathBuf::from(".cloudcache").join("volumes").join(volume_id);
+    let default = default_volume_cache_dir(volume_id);
     if default.exists() {
         return Ok(default);
+    }
+    let cwd_default = PathBuf::from(".cloudcache").join("volumes").join(volume_id);
+    if cwd_default.exists() {
+        return Ok(cwd_default);
     }
     let var_default = PathBuf::from("/var/lib/cloudcache/volumes").join(volume_id);
     if var_default.exists() {
@@ -280,15 +329,11 @@ fn register_volume(volume_id: &str, cache_dir: &Path) -> Result<()> {
     map.insert(volume_id.to_string(), cache_dir.to_path_buf());
     let mut rows: Vec<_> = map.into_iter().collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&registry)?;
+    let mut bytes = Vec::new();
     for (id, path) in rows {
-        writeln!(file, "{id}\t{}", path.display())?;
+        bytes.extend_from_slice(format!("{id}\t{}\n", path.display()).as_bytes());
     }
-    file.sync_all()?;
+    atomic_write(&registry, &bytes)?;
     Ok(())
 }
 
@@ -297,13 +342,80 @@ fn read_registry() -> Result<HashMap<String, PathBuf>> {
     if !path.exists() {
         return Ok(HashMap::new());
     }
-    let text = fs::read_to_string(path)?;
+    let text = fs::read_to_string(&path)?;
     let mut map = HashMap::new();
-    for line in text.lines() {
-        let Some((id, path)) = line.split_once('\t') else {
+    for (line_number, line) in text.lines().enumerate() {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
             continue;
+        }
+        let Some((id, path)) = line.split_once('\t') else {
+            return Err(CloudError::Corrupt(format!(
+                "invalid registry line {} in {}",
+                line_number + 1,
+                path.display()
+            )));
         };
         map.insert(id.to_string(), PathBuf::from(path));
     }
     Ok(map)
+}
+
+fn validate_volume_id(volume_id: &str) -> Result<()> {
+    if volume_id.is_empty() {
+        return Err(CloudError::InvalidArgument(
+            "volume-id must not be empty".to_string(),
+        ));
+    }
+    if volume_id.len() > 128 {
+        return Err(CloudError::InvalidArgument(
+            "volume-id must be at most 128 bytes".to_string(),
+        ));
+    }
+    if volume_id == "." || volume_id == ".." {
+        return Err(CloudError::InvalidArgument(
+            "volume-id must not be '.' or '..'".to_string(),
+        ));
+    }
+    if !volume_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(CloudError::InvalidArgument(
+            "volume-id may only contain ASCII letters, digits, '.', '_' and '-'".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_volume_layout(size: u64, chunk_size: u64, cache_max: u64) -> Result<()> {
+    if size == 0 || chunk_size == 0 || cache_max == 0 {
+        return Err(CloudError::InvalidArgument(
+            "size, chunk-size and cache-size must be non-zero".to_string(),
+        ));
+    }
+    if chunk_size > size {
+        return Err(CloudError::InvalidArgument(
+            "chunk-size must not exceed volume size".to_string(),
+        ));
+    }
+    for (name, value) in [
+        ("size", size),
+        ("chunk-size", chunk_size),
+        ("cache-size", cache_max),
+    ] {
+        if !value.is_multiple_of(DEFAULT_SECTOR_SIZE_BYTES) {
+            return Err(CloudError::InvalidArgument(format!(
+                "{name} must be a multiple of {DEFAULT_SECTOR_SIZE_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn absolute_path(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
 }

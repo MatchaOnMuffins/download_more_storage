@@ -1,6 +1,5 @@
 use crate::checksum::sha256_hex;
-use crate::cloud::CloudBackend;
-use crate::cloud::local_mock::LocalMockCloud;
+use crate::cloud::{CloudBackend, ConfiguredCloudBackend};
 use crate::error::{CloudError, Result};
 use crate::journal::wal::{Journal, JournalEvent};
 use crate::metadata::{ChunkMeta, ChunkState, MetadataDb, MetadataStats};
@@ -17,7 +16,7 @@ pub struct CacheEngine {
     pub local_manifest: LocalManifest,
     db: MetadataDb,
     journal: Journal,
-    cloud: LocalMockCloud,
+    cloud: ConfiguredCloudBackend,
 }
 
 #[derive(Debug, Clone)]
@@ -26,21 +25,27 @@ pub struct VolumeStatus {
     pub volume_size_bytes: u64,
     pub chunk_size_bytes: u64,
     pub cache_max_bytes: u64,
-    pub remote_dir: PathBuf,
+    pub cloud_backend: String,
     pub metadata: MetadataStats,
 }
 
 impl CacheEngine {
     pub fn create(cloud_manifest: CloudManifest, local_manifest: LocalManifest) -> Result<Self> {
+        cloud_manifest.validate()?;
+        local_manifest.validate()?;
+        if cloud_manifest.volume_id != local_manifest.volume_id {
+            return Err(CloudError::InvalidArgument(
+                "cloud and local manifests must use the same volume id".to_string(),
+            ));
+        }
         ensure_dir(&local_manifest.cache_dir)?;
         ensure_dir(&local_manifest.cache_dir.join("chunks"))?;
         ensure_dir(&local_manifest.cache_dir.join("journal"))?;
         ensure_dir(&local_manifest.cache_dir.join("tmp"))?;
 
-        let cloud = LocalMockCloud::new(&local_manifest.remote_dir);
-        cloud.init()?;
+        let cloud = ConfiguredCloudBackend::from_manifest(&local_manifest)?;
+        cloud.init(&cloud_manifest)?;
         cloud_manifest.write(&local_manifest.cache_dir.join("manifest.json"))?;
-        cloud_manifest.write(&local_manifest.remote_dir.join("manifest.json"))?;
         local_manifest.write()?;
 
         let db = MetadataDb::open(local_manifest.cache_dir.join("metadata.sqlite"))?;
@@ -57,9 +62,15 @@ impl CacheEngine {
     pub fn open(cache_dir: &Path) -> Result<Self> {
         let local_manifest = LocalManifest::read(cache_dir)?;
         let cloud_manifest = CloudManifest::read(&local_manifest.cache_dir.join("manifest.json"))?;
+        if cloud_manifest.volume_id != local_manifest.volume_id {
+            return Err(CloudError::Corrupt(format!(
+                "cloud manifest volume '{}' does not match local manifest volume '{}'",
+                cloud_manifest.volume_id, local_manifest.volume_id
+            )));
+        }
         let db = MetadataDb::open(local_manifest.cache_dir.join("metadata.sqlite"))?;
         let journal = Journal::open(&local_manifest.cache_dir.join("journal"))?;
-        let cloud = LocalMockCloud::new(&local_manifest.remote_dir);
+        let cloud = ConfiguredCloudBackend::from_manifest(&local_manifest)?;
         let mut engine = Self {
             cloud_manifest,
             local_manifest,
@@ -172,11 +183,32 @@ impl CacheEngine {
                     meta.chunk_id
                 )));
             };
+            let data = match fs::read(&path) {
+                Ok(data) => data,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    meta.state = ChunkState::Error;
+                    meta.local_path = None;
+                    meta.size_bytes = 0;
+                    meta.dirty_since_ns = None;
+                    self.db.upsert_chunk(&meta)?;
+                    return Err(CloudError::Corrupt(format!(
+                        "dirty chunk {} has no local file",
+                        meta.chunk_id
+                    )));
+                }
+                Err(err) => return Err(err.into()),
+            };
+            let generation = meta.local_generation.unwrap_or(0);
             meta.state = ChunkState::Uploading;
             self.db.upsert_chunk(&meta)?;
-            let data = fs::read(&path)?;
-            let generation = meta.local_generation.unwrap_or(0);
-            let checksum = self.cloud.upload_chunk(meta.chunk_id, generation, &data)?;
+            let checksum = match self.cloud.upload_chunk(meta.chunk_id, generation, &data) {
+                Ok(checksum) => checksum,
+                Err(err) => {
+                    meta.state = ChunkState::Dirty;
+                    self.db.upsert_chunk(&meta)?;
+                    return Err(err);
+                }
+            };
             meta.state = ChunkState::Clean;
             meta.remote_generation = Some(generation);
             meta.checksum = Some(checksum.clone());
@@ -234,7 +266,7 @@ impl CacheEngine {
             volume_size_bytes: self.cloud_manifest.volume_size_bytes,
             chunk_size_bytes: self.cloud_manifest.chunk_size_bytes,
             cache_max_bytes: self.local_manifest.cache_max_bytes,
-            remote_dir: self.cloud.root().to_path_buf(),
+            cloud_backend: self.cloud.describe(),
             metadata: self.db.stats(self.total_chunks())?,
         })
     }
@@ -254,11 +286,20 @@ impl CacheEngine {
                         .unwrap_or(true);
                     if missing_file {
                         findings.push(format!(
-                            "chunk {} had state {} but no local file; marking missing",
+                            "chunk {} had state {} but no local file; marking {}",
                             meta.chunk_id,
-                            meta.state.as_str()
+                            meta.state.as_str(),
+                            if matches!(meta.state, ChunkState::Dirty | ChunkState::Uploading) {
+                                ChunkState::Error.as_str()
+                            } else {
+                                ChunkState::Missing.as_str()
+                            }
                         ));
-                        meta.state = ChunkState::Missing;
+                        if matches!(meta.state, ChunkState::Dirty | ChunkState::Uploading) {
+                            meta.state = ChunkState::Error;
+                        } else {
+                            meta.state = ChunkState::Missing;
+                        }
                         meta.local_path = None;
                         meta.size_bytes = 0;
                         meta.dirty_since_ns = None;
@@ -372,15 +413,21 @@ impl CacheEngine {
     }
 
     fn ensure_chunk_for_read(&mut self, chunk_id: u64) -> Result<PathBuf> {
-        if let Some(meta) = self.db.get_chunk(chunk_id)?
-            && matches!(meta.state, ChunkState::Clean | ChunkState::Dirty)
-            && meta
-                .local_path
-                .as_ref()
-                .map(|p| p.exists())
-                .unwrap_or(false)
-        {
-            return Ok(meta.local_path.unwrap());
+        if let Some(meta) = self.db.get_chunk(chunk_id)? {
+            if meta.state == ChunkState::Error {
+                return Err(CloudError::Corrupt(format!(
+                    "chunk {chunk_id} is in error state; run fsck and restore from a valid backup"
+                )));
+            }
+            if matches!(meta.state, ChunkState::Clean | ChunkState::Dirty)
+                && meta
+                    .local_path
+                    .as_ref()
+                    .map(|p| p.exists())
+                    .unwrap_or(false)
+            {
+                return Ok(meta.local_path.unwrap());
+            }
         }
 
         let path = self.chunk_path(chunk_id);
@@ -428,6 +475,7 @@ impl CacheEngine {
         let file = File::create(&path)?;
         file.set_len(self.chunk_len(chunk_id))?;
         file.sync_all()?;
+        fsync_parent(&path)?;
         Ok(path)
     }
 
@@ -454,7 +502,7 @@ impl CacheEngine {
 #[cfg(test)]
 mod tests {
     use super::CacheEngine;
-    use crate::volume::manifest::{CloudManifest, LocalManifest};
+    use crate::volume::manifest::{CloudConfig, CloudManifest, LocalManifest};
     use std::fs;
     use std::path::PathBuf;
 
@@ -477,9 +525,14 @@ mod tests {
             LocalManifest::new(
                 "test".to_string(),
                 cache_dir,
-                "mock".to_string(),
-                "cloudcache/volumes/test".to_string(),
-                remote_dir,
+                CloudConfig {
+                    provider: "local_mock".to_string(),
+                    bucket: "mock".to_string(),
+                    prefix: "cloudcache/volumes/test".to_string(),
+                    remote_dir,
+                    region: None,
+                    endpoint_url: None,
+                },
                 cache_max_bytes,
             ),
         )
@@ -512,5 +565,31 @@ mod tests {
         let mut reopened = CacheEngine::open(&cache_dir).unwrap();
         reopened.fsck().unwrap();
         assert_eq!(reopened.read_at(4096, data.len()).unwrap(), data);
+    }
+
+    #[test]
+    fn missing_dirty_chunk_is_error_not_zero_filled() {
+        let mut engine = engine("missing-dirty", 1024 * 1024);
+        let data = b"dirty data that only exists locally".to_vec();
+        engine.write_at(4096, &data).unwrap();
+
+        let chunk_path = engine
+            .local_manifest
+            .cache_dir
+            .join("chunks")
+            .join("0000000000000000.chunk");
+        fs::remove_file(chunk_path).unwrap();
+
+        let findings = engine.fsck().unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.contains("marking error"))
+        );
+        assert_eq!(
+            engine.db.get_chunk(0).unwrap().unwrap().state,
+            crate::metadata::ChunkState::Error
+        );
+        assert!(engine.read_at(4096, data.len()).is_err());
     }
 }

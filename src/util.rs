@@ -113,10 +113,21 @@ pub fn registry_path() -> PathBuf {
     if let Ok(path) = std::env::var("CLOUDCACHE_REGISTRY") {
         return PathBuf::from(path);
     }
+    cloudcache_home().join("volumes.tsv")
+}
+
+pub fn default_volume_cache_dir(volume_id: &str) -> PathBuf {
+    cloudcache_home().join("volumes").join(volume_id)
+}
+
+fn cloudcache_home() -> PathBuf {
+    if let Ok(path) = std::env::var("CLOUDCACHE_HOME") {
+        return PathBuf::from(path);
+    }
     if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".cloudcache").join("volumes.tsv")
+        PathBuf::from(home).join(".cloudcache")
     } else {
-        PathBuf::from(".cloudcache").join("volumes.tsv")
+        PathBuf::from(".cloudcache")
     }
 }
 

@@ -264,18 +264,18 @@ fn chunk_meta_from_row(row: &Row<'_>) -> rusqlite::Result<ChunkMeta> {
     let pin_count = row.get::<_, i64>(9)?;
 
     Ok(ChunkMeta {
-        chunk_id: from_i64_for_row(chunk_id),
+        chunk_id: from_i64_for_row(chunk_id, 0, "chunk_id")?,
         local_path: local_path.map(PathBuf::from),
         state: ChunkState::try_from(state.as_str()).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(err))
         })?,
-        size_bytes: from_i64_for_row(size_bytes),
-        remote_generation: remote_generation.map(from_i64_for_row),
-        local_generation: local_generation.map(from_i64_for_row),
+        size_bytes: from_i64_for_row(size_bytes, 3, "size_bytes")?,
+        remote_generation: opt_from_i64_for_row(remote_generation, 4, "remote_generation")?,
+        local_generation: opt_from_i64_for_row(local_generation, 5, "local_generation")?,
         checksum,
-        last_access_ns: last_access_ns as u128,
-        dirty_since_ns: dirty_since_ns.map(|value| value as u128),
-        pin_count: from_i64_for_row(pin_count),
+        last_access_ns: from_i64_for_row(last_access_ns, 7, "last_access_ns")? as u128,
+        dirty_since_ns: opt_from_i64_for_row(dirty_since_ns, 8, "dirty_since_ns")?.map(u128::from),
+        pin_count: from_i64_for_row(pin_count, 9, "pin_count")?,
     })
 }
 
@@ -302,6 +302,24 @@ fn from_i64(value: i64, name: &str) -> Result<u64> {
         .map_err(|_| CloudError::Corrupt(format!("{name} is negative in metadata database")))
 }
 
-fn from_i64_for_row(value: i64) -> u64 {
-    u64::try_from(value).unwrap_or(0)
+fn opt_from_i64_for_row(
+    value: Option<i64>,
+    column: usize,
+    name: &str,
+) -> rusqlite::Result<Option<u64>> {
+    value
+        .map(|value| from_i64_for_row(value, column, name))
+        .transpose()
+}
+
+fn from_i64_for_row(value: i64, column: usize, name: &str) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Integer,
+            Box::new(CloudError::Corrupt(format!(
+                "{name} is negative in metadata database"
+            ))),
+        )
+    })
 }

@@ -1,5 +1,5 @@
 use crate::error::{CloudError, Result};
-use crate::util::{ensure_dir, now_ns};
+use crate::util::{ensure_dir, fsync_parent, now_ns};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -97,6 +97,7 @@ impl Journal {
             file.sync_all()?;
         }
         fs::rename(&tmp, &self.path)?;
+        fsync_parent(&self.path)?;
         Ok(())
     }
 }

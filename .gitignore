@@ -1,7 +1,9 @@
 /target/
 /.cloudcache/
 /.cloudcache-*/
+.env
+.env.*
+!.env.example
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
-
