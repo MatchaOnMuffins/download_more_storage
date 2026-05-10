@@ -1,0 +1,7 @@
+/target/
+/.cloudcache/
+/.cloudcache-*/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
